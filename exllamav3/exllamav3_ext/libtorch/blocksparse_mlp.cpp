@@ -352,8 +352,11 @@ at::Tensor BC_BlockSparseMLP::run_bszN
     // Ensure output buffer is large enough
     if (out_final_max_bsz < bsz)
     {
-        // Allocate generously to minimize reallocations (256 covers typical generator batch sizes)
-        out_final_max_bsz = std::max(bsz, 8);
+        // Allocate generously to minimize reallocations
+        // Round up to power of 2 for better graph cache reuse
+        int new_max = 8;
+        while (new_max < bsz) new_max *= 2;
+        out_final_max_bsz = new_max;
         out_final = torch::empty(
             {out_final_max_bsz, hidden},
             torch::TensorOptions().dtype(at::kHalf).device(y.device())
@@ -383,7 +386,14 @@ at::Tensor BC_BlockSparseMLP::run_bszN
         // Build parameter update list for the graph
         // For each token in batch, we have: gate mgemm, up mgemm, activation, down mgemm, copy
         // The mgemm calls record: GP_mgemm_A, GP_mgemm_C, GP_mgemm_indices, GP_mgemm_weights, GP_end
-        std::vector<PPTR> args;
+        
+        // Calculate required size and reserve capacity to avoid reallocations
+        // Per token: 3 (gate) + 3 (up) + 3 (down) + optional 4 (shared_experts) = 9-13 PPTRs
+        int args_per_token = 9 + (shared_experts ? 4 : 0);
+        int required_size = bsz * args_per_token;
+        if (graph_args.capacity() < required_size)
+            graph_args.reserve(required_size * 2);  // Reserve 2x to reduce future reallocations
+        graph_args.clear();
 
         for (int i = 0; i < bsz; ++i)
         {
@@ -393,21 +403,21 @@ at::Tensor BC_BlockSparseMLP::run_bszN
             void* w_ptr = (void*)((half*)routing_weights.data_ptr() + i * routing_weights.size(1));
 
             // Gate mgemm params
-            args.push_back(PPTR(GP_mgemm_A, y_ptr));
-            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
-            args.push_back(PPTR(GP_end, nullptr));
+            graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+            graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            graph_args.push_back(PPTR(GP_end, nullptr));
 
             // Up mgemm params
-            args.push_back(PPTR(GP_mgemm_A, y_ptr));
-            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
-            args.push_back(PPTR(GP_end, nullptr));
+            graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+            graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            graph_args.push_back(PPTR(GP_end, nullptr));
 
             // Activation doesn't need param updates (uses fixed intermediate buffers)
 
             // Down mgemm params (includes weights for reduction)
-            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
-            args.push_back(PPTR(GP_mgemm_weights, w_ptr));
-            args.push_back(PPTR(GP_end, nullptr));
+            graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            graph_args.push_back(PPTR(GP_mgemm_weights, w_ptr));
+            graph_args.push_back(PPTR(GP_end, nullptr));
 
             // Handle shared experts if present (comes before copy in run_bszN_gr)
             if (shared_experts)
@@ -415,18 +425,18 @@ at::Tensor BC_BlockSparseMLP::run_bszN
                 if (shared_gate)
                 {
                     // shared_experts mgemm + add_sigmoid_gate_proj
-                    args.push_back(PPTR(GP_mgemm_A, y_ptr));
-                    args.push_back(PPTR(GP_add_sigmoid_gate_proj_y, y_ptr));
-                    args.push_back(PPTR(GP_add_sigmoid_gate_proj_z, (void*)out_d.data_ptr()));
-                    args.push_back(PPTR(GP_end, nullptr));
+                    graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                    graph_args.push_back(PPTR(GP_add_sigmoid_gate_proj_y, y_ptr));
+                    graph_args.push_back(PPTR(GP_add_sigmoid_gate_proj_z, (void*)out_d.data_ptr()));
+                    graph_args.push_back(PPTR(GP_end, nullptr));
                 }
                 else
                 {
                     // shared_experts mgemm + add
-                    args.push_back(PPTR(GP_mgemm_A, y_ptr));
-                    args.push_back(PPTR(GP_add_x, (void*)out_d.data_ptr()));
-                    args.push_back(PPTR(GP_add_z, (void*)out_d.data_ptr()));
-                    args.push_back(PPTR(GP_end, nullptr));
+                    graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                    graph_args.push_back(PPTR(GP_add_x, (void*)out_d.data_ptr()));
+                    graph_args.push_back(PPTR(GP_add_z, (void*)out_d.data_ptr()));
+                    graph_args.push_back(PPTR(GP_end, nullptr));
                 }
             }
 
@@ -434,7 +444,7 @@ at::Tensor BC_BlockSparseMLP::run_bszN
             // (src is always out_d base, dst is out_final + offset, both stable after allocation)
         }
 
-        g.launch(args, stream);
+        g.launch(graph_args, stream);
 
     #endif
 

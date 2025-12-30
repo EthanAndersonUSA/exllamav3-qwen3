@@ -58,6 +58,7 @@ struct BC_BlockSparseMLP
     at::Tensor out_final;                        // Persistent output buffer for batched path
     int out_final_max_bsz = 0;                   // Current max batch size allocated
     int hidden_size = 0;                         // Hidden size for buffer allocation
+    std::vector<PPTR> graph_args;                // Pre-allocated vector for graph param updates
 
     BC_BlockSparseMLP
     (
