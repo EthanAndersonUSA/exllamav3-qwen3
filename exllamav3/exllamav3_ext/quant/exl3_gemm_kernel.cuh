@@ -239,6 +239,9 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
+            // If C_red is provided, write the reduced (weighted) sum there instead of into C[0].
+            // This lets callers keep C as a scratch buffer while emitting the final output
+            // directly into a separate destination (e.g. a per-token output row).
             if constexpr (c_fp32)
             {
                 float* C__ = ((float*) C) + this_warp * 32 + this_lane;
@@ -249,7 +252,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     sum += *C___;
                     C___ += size_m * size_n;
                 }
-                *C__ = sum;
+                float* C_dst = (C_red ? ((float*) C_red) : ((float*) C)) + this_warp * 32 + this_lane;
+                *C_dst = sum;
             }
             else
             {
@@ -261,7 +265,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     sum = __hadd(sum, *C___);
                     C___ += size_m * size_n;
                 }
-                *C__ = sum;
+                half* C_dst = (C_red ? ((half*) C_red) : ((half*) C)) + this_warp * 32 + this_lane;
+                *C_dst = sum;
             }
         }
     }

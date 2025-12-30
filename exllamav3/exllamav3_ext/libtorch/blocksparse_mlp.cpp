@@ -9,13 +9,6 @@
 #include "../activation.cuh"
 #include "../add.cuh"
 
-// Graph-safe copy: uses cudaMemcpyAsync with raw pointers, no tensor allocations during capture
-static void copy_row_gr(const half* src, half* dst, int n, Graph* graph)
-{
-    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    cudaMemcpyAsync(dst, src, n * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-}
-
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
     const py::object& cfg,
@@ -96,6 +89,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         min_expert,
         max_expert,
         0,
+        {},
         graph
     );
 
@@ -116,6 +110,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         min_expert,
         max_expert,
         0,
+        {},
         graph
     );
 
@@ -141,6 +136,7 @@ void BC_BlockSparseMLP::run_bsz1_gr
         min_expert,
         max_expert,
         0,
+        {},
         graph
     );
 
@@ -258,6 +254,7 @@ void BC_BlockSparseMLP::run_bszN_gr
             min_expert,
             max_expert,
             0,
+            {},
             graph
         );
 
@@ -279,6 +276,7 @@ void BC_BlockSparseMLP::run_bszN_gr
             min_expert,
             max_expert,
             0,
+            {},
             graph
         );
 
@@ -288,7 +286,10 @@ void BC_BlockSparseMLP::run_bszN_gr
         else if (act_gelu)
             gelu_mul_gr(interm_g, interm_u, interm_a, graph);
 
-        // Down projection with expert weights reduction
+        // Down projection with expert weights reduction:
+        // - Use out_d as scratch for per-expert outputs
+        // - Write the final reduced sum directly into out_final[i] (C_red) to avoid a copy
+        at::Tensor out_i = out_final.slice(0, i, i + 1).unsqueeze(0);
         exl3_mgemm_gr
         (
             interm_a,
@@ -306,6 +307,7 @@ void BC_BlockSparseMLP::run_bszN_gr
             min_expert,
             max_expert,
             0,
+            out_i,
             graph
         );
 
@@ -316,19 +318,13 @@ void BC_BlockSparseMLP::run_bszN_gr
             shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
             if (shared_gate)
             {
-                add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_d, shared_gate->weight, graph);
+                add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_i, shared_gate->weight, graph);
             }
             else
             {
-                add_gr(out_d, out_d_sh.value(), out_d, graph);
+                add_gr(out_i, out_d_sh.value(), out_i, graph);
             }
         }
-
-        // Copy reduced output from out_d[0,0,:] into out_final[i,:]
-        // Use raw pointers to avoid any tensor allocations during CUDA graph capture
-        const half* src_ptr = (const half*) out_d.data_ptr();  // out_d[0,0,0] is at base
-        half* dst_ptr = ((half*) out_final.data_ptr()) + i * hidden_size;
-        copy_row_gr(src_ptr, dst_ptr, hidden_size, graph);
     }
 }
 
@@ -359,7 +355,7 @@ at::Tensor BC_BlockSparseMLP::run_bszN
         out_final_max_bsz = new_max;
         out_final = torch::empty(
             {out_final_max_bsz, hidden},
-            torch::TensorOptions().dtype(at::kHalf).device(y.device())
+            torch::TensorOptions().dtype(out_d.dtype()).device(y.device())
         );
         // MUST invalidate all captured graphs: they contain the old out_final pointer
         graphs_bszN.clear();
@@ -388,7 +384,11 @@ at::Tensor BC_BlockSparseMLP::run_bszN
         // The mgemm calls record: GP_mgemm_A, GP_mgemm_C, GP_mgemm_indices, GP_mgemm_weights, GP_end
         
         // Calculate required size and reserve capacity to avoid reallocations
-        // Per token: 3 (gate) + 3 (up) + 3 (down) + optional 4 (shared_experts) = 9-13 PPTRs
+        // Per token:
+        //   gate:   3 (A, indices, end)
+        //   up:     3 (A, indices, end)
+        //   down:   3 (indices, weights, end)  // outputs reduced sum directly to out_final row (via C_red)
+        //   shared: 4 (A, add_y, add_z, end) or (A, add_x, add_z, end)
         int args_per_token = 9 + (shared_experts ? 4 : 0);
         int required_size = bsz * args_per_token;
         if (graph_args.capacity() < required_size)
@@ -401,6 +401,7 @@ at::Tensor BC_BlockSparseMLP::run_bszN
             void* y_ptr = (void*)((half*)y.data_ptr() + i * hidden);
             void* idx_ptr = (void*)((int64_t*)selected_experts.data_ptr() + i * selected_experts.size(1));
             void* w_ptr = (void*)((half*)routing_weights.data_ptr() + i * routing_weights.size(1));
+            void* out_ptr = (void*) ((char*) out_final.data_ptr() + (int64_t) i * (int64_t) hidden * (int64_t) out_final.element_size());
 
             // Gate mgemm params
             graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
@@ -427,21 +428,20 @@ at::Tensor BC_BlockSparseMLP::run_bszN
                     // shared_experts mgemm + add_sigmoid_gate_proj
                     graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
                     graph_args.push_back(PPTR(GP_add_sigmoid_gate_proj_y, y_ptr));
-                    graph_args.push_back(PPTR(GP_add_sigmoid_gate_proj_z, (void*)out_d.data_ptr()));
+                    graph_args.push_back(PPTR(GP_add_sigmoid_gate_proj_z, out_ptr));
                     graph_args.push_back(PPTR(GP_end, nullptr));
                 }
                 else
                 {
                     // shared_experts mgemm + add
                     graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
-                    graph_args.push_back(PPTR(GP_add_x, (void*)out_d.data_ptr()));
-                    graph_args.push_back(PPTR(GP_add_z, (void*)out_d.data_ptr()));
+                    graph_args.push_back(PPTR(GP_add_x, out_ptr));
+                    graph_args.push_back(PPTR(GP_add_z, out_ptr));
                     graph_args.push_back(PPTR(GP_end, nullptr));
                 }
             }
 
-            // Copy kernel uses raw pointers - no graph param updates needed
-            // (src is always out_d base, dst is out_final + offset, both stable after allocation)
+            // No copy needed: down mgemm writes reduced output directly into out_final
         }
 
         g.launch(graph_args, stream);

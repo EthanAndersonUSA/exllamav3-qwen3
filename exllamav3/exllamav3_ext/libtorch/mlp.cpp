@@ -34,6 +34,7 @@ void BC_GatedMLP::run_bsz1_gr
         -1,
         -1,
         0,
+        {},
         graph
     );
 

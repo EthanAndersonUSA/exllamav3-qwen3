@@ -225,6 +225,7 @@ int exl3_mgemm_gr
     int min_index,
     int max_index,
     int force_num_sms,
+    const c10::optional<at::Tensor>& C_red,
     Graph* graph
 )
 {
@@ -285,6 +286,14 @@ int exl3_mgemm_gr
     const half* A_ptr = (const half*) A.data_ptr();
     const uintptr_t* B_ptr_ptr = (const uintptr_t*) B.data_ptr();
     void* C_ptr = (void*) C.data_ptr();
+    void* C_red_ptr = nullptr;
+    if (C_red)
+    {
+        TORCH_CHECK(C_red.value().scalar_type() == C.scalar_type(), "C_red dtype must match C");
+        TORCH_CHECK(C_red.value().is_cuda(), "C_red must be a CUDA tensor");
+        TORCH_CHECK(C_red.value().numel() >= (int64_t) size_m * (int64_t) size_n, "C_red has insufficient size");
+        C_red_ptr = (void*) C_red.value().data_ptr();
+    }
     const half* A_had_ptr = (const half*) A_had.data_ptr();
     const uintptr_t* suh_ptr_ptr = (const uintptr_t*) suh.data_ptr();
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
@@ -351,7 +360,8 @@ int exl3_mgemm_gr
         (void*)& bszm_in,
         (void*)& bszm_out,
         (void*)& min_index,
-        (void*)& max_index
+        (void*)& max_index,
+        (void*)& C_red_ptr
     };
 
     cudaLaunchCooperativeKernel
@@ -410,6 +420,7 @@ int exl3_mgemm
         min_index,
         max_index,
         force_num_sms,
+        {},
         nullptr
     );
 }

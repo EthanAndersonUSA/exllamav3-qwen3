@@ -49,6 +49,7 @@ int exl3_mgemm_gr
     int min_index,
     int max_index,
     int force_num_sms,
+    const c10::optional<at::Tensor>& C_red,
     Graph* graph
 );
 
