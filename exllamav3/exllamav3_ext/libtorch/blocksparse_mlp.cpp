@@ -9,6 +9,13 @@
 #include "../activation.cuh"
 #include "../add.cuh"
 
+// Graph-safe copy: uses cudaMemcpyAsync with raw pointers, no tensor allocations during capture
+static void copy_row_gr(const half* src, half* dst, int n, Graph* graph)
+{
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    cudaMemcpyAsync(dst, src, n * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+}
+
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
     const py::object& cfg,
@@ -213,4 +220,223 @@ void BC_BlockSparseMLP::run_bsz1
         graph_bsz1.launch(args, stream);
 
     #endif
+}
+
+void BC_BlockSparseMLP::run_bszN_gr
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights,
+    int bsz,
+    Graph* graph
+)
+{
+    // Process each token in the batch sequentially using the optimized mgemm kernels
+    // This moves the Python loop into C++ and enables CUDA graph capture
+    for (int i = 0; i < bsz; ++i)
+    {
+        // Slice input for this token: y is [bsz, hidden], we need [1, 1, hidden] for mgemm
+        at::Tensor yi = y.slice(0, i, i + 1).unsqueeze(0);
+        at::Tensor idx_i = selected_experts.slice(0, i, i + 1);
+        at::Tensor w_i = routing_weights.slice(0, i, i + 1);
+
+        // Gate projection
+        exl3_mgemm_gr
+        (
+            yi,
+            gate_ptrs_trellis,
+            interm_g,
+            gate_ptrs_suh,
+            yh,
+            gate_ptrs_svh,
+            idx_i,
+            {},
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph
+        );
+
+        // Up projection
+        exl3_mgemm_gr
+        (
+            yi,
+            up_ptrs_trellis,
+            interm_u,
+            up_ptrs_suh,
+            yh,
+            up_ptrs_svh,
+            idx_i,
+            {},
+            up_K,
+            -1,
+            up_mcg,
+            up_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph
+        );
+
+        // Activation function
+        if (act_silu)
+            silu_mul_gr(interm_g, interm_u, interm_a, graph);
+        else if (act_gelu)
+            gelu_mul_gr(interm_g, interm_u, interm_a, graph);
+
+        // Down projection with expert weights reduction
+        exl3_mgemm_gr
+        (
+            interm_a,
+            down_ptrs_trellis,
+            out_d,
+            down_ptrs_suh,
+            interm_a,
+            down_ptrs_svh,
+            idx_i,
+            w_i,
+            down_K,
+            -1,
+            down_mcg,
+            down_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph
+        );
+
+        // Handle shared experts if present (before copy, so result accumulates in out_d)
+        if (shared_experts)
+        {
+            TORCH_CHECK(out_d_sh.has_value(), "shared_experts set but out_d_sh buffer is missing");
+            shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
+            if (shared_gate)
+            {
+                add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_d, shared_gate->weight, graph);
+            }
+            else
+            {
+                add_gr(out_d, out_d_sh.value(), out_d, graph);
+            }
+        }
+
+        // Copy reduced output from out_d[0,0,:] into out_final[i,:]
+        // Use raw pointers to avoid any tensor allocations during CUDA graph capture
+        const half* src_ptr = (const half*) out_d.data_ptr();  // out_d[0,0,0] is at base
+        half* dst_ptr = ((half*) out_final.data_ptr()) + i * hidden_size;
+        copy_row_gr(src_ptr, dst_ptr, hidden_size, graph);
+    }
+}
+
+at::Tensor BC_BlockSparseMLP::run_bszN
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    c10::cuda::CUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    py::gil_scoped_release _;
+
+    int bsz = y.size(0);
+    int hidden = y.size(1);
+
+    // Store hidden size for buffer operations
+    if (hidden_size == 0) hidden_size = hidden;
+
+    // Ensure output buffer is large enough
+    if (out_final_max_bsz < bsz)
+    {
+        // Allocate generously to minimize reallocations (256 covers typical generator batch sizes)
+        out_final_max_bsz = std::max(bsz, 8);
+        out_final = torch::empty(
+            {out_final_max_bsz, hidden},
+            torch::TensorOptions().dtype(at::kHalf).device(y.device())
+        );
+        // MUST invalidate all captured graphs: they contain the old out_final pointer
+        graphs_bszN.clear();
+    }
+
+    #define USE_GRAPH_BSZN
+    #ifndef USE_GRAPH_BSZN
+
+        // Direct C++ execution without graph (still much faster than Python loop)
+        run_bszN_gr(y, selected_experts, routing_weights, bsz, nullptr);
+
+    #else
+
+        // Get or create graph for this batch size
+        Graph& g = graphs_bszN[bsz];
+
+        if (!g.ready)
+        {
+            g.capture_begin();
+            run_bszN_gr(y, selected_experts, routing_weights, bsz, &g);
+            g.capture_end();
+        }
+
+        // Build parameter update list for the graph
+        // For each token in batch, we have: gate mgemm, up mgemm, activation, down mgemm, copy
+        // The mgemm calls record: GP_mgemm_A, GP_mgemm_C, GP_mgemm_indices, GP_mgemm_weights, GP_end
+        std::vector<PPTR> args;
+
+        for (int i = 0; i < bsz; ++i)
+        {
+            // Get pointers for this token's data
+            void* y_ptr = (void*)((half*)y.data_ptr() + i * hidden);
+            void* idx_ptr = (void*)((int64_t*)selected_experts.data_ptr() + i * selected_experts.size(1));
+            void* w_ptr = (void*)((half*)routing_weights.data_ptr() + i * routing_weights.size(1));
+
+            // Gate mgemm params
+            args.push_back(PPTR(GP_mgemm_A, y_ptr));
+            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            args.push_back(PPTR(GP_end, nullptr));
+
+            // Up mgemm params
+            args.push_back(PPTR(GP_mgemm_A, y_ptr));
+            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            args.push_back(PPTR(GP_end, nullptr));
+
+            // Activation doesn't need param updates (uses fixed intermediate buffers)
+
+            // Down mgemm params (includes weights for reduction)
+            args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+            args.push_back(PPTR(GP_mgemm_weights, w_ptr));
+            args.push_back(PPTR(GP_end, nullptr));
+
+            // Handle shared experts if present (comes before copy in run_bszN_gr)
+            if (shared_experts)
+            {
+                if (shared_gate)
+                {
+                    // shared_experts mgemm + add_sigmoid_gate_proj
+                    args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                    args.push_back(PPTR(GP_add_sigmoid_gate_proj_y, y_ptr));
+                    args.push_back(PPTR(GP_add_sigmoid_gate_proj_z, (void*)out_d.data_ptr()));
+                    args.push_back(PPTR(GP_end, nullptr));
+                }
+                else
+                {
+                    // shared_experts mgemm + add
+                    args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                    args.push_back(PPTR(GP_add_x, (void*)out_d.data_ptr()));
+                    args.push_back(PPTR(GP_add_z, (void*)out_d.data_ptr()));
+                    args.push_back(PPTR(GP_end, nullptr));
+                }
+            }
+
+            // Copy kernel uses raw pointers - no graph param updates needed
+            // (src is always out_d base, dst is out_final + offset, both stable after allocation)
+        }
+
+        g.launch(args, stream);
+
+    #endif
+
+    return out_final.slice(0, 0, bsz);
 }

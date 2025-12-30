@@ -2,6 +2,7 @@
 
 #include <ATen/Tensor.h>
 #include <vector>
+#include <map>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 
@@ -51,6 +52,12 @@ struct BC_BlockSparseMLP
     std::shared_ptr<BC_LinearFP16> shared_gate;
 
     Graph graph_bsz1;
+
+    // Members for batched MoE (bsz > 1)
+    std::map<int, Graph> graphs_bszN;           // CUDA graphs for each batch size
+    at::Tensor out_final;                        // Persistent output buffer for batched path
+    int out_final_max_bsz = 0;                   // Current max batch size allocated
+    int hidden_size = 0;                         // Hidden size for buffer allocation
 
     BC_BlockSparseMLP
     (
@@ -128,6 +135,24 @@ struct BC_BlockSparseMLP
     );
 
     void run_bsz1
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights
+    );
+
+    // Batched MoE path for bsz > 1 (graph recording version)
+    void run_bszN_gr
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights,
+        int bsz,
+        Graph* graph
+    );
+
+    // Batched MoE path for bsz > 1 (main entry point)
+    at::Tensor run_bszN
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,

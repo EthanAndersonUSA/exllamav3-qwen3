@@ -561,7 +561,17 @@ class BlockSparseMLP(Module):
             final_hidden_states = final_hidden_states.reshape(x.shape)
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
-        # Fused path
+        # Fused path for bsz > 1 - use optimized C++ implementation with CUDA graph
+        elif bsz > 1 and self.bc is not None:
+
+            # Use the new optimized C++ batched path
+            # This moves the per-token loop from Python to C++ and uses CUDA graphs
+            # y is [bsz, hidden], selected_experts is [bsz, num_experts_per_tok], routing_weights is [bsz, num_experts_per_tok]
+            final_hidden_states = self.bc.run_bszN(y, selected_experts, routing_weights)
+            final_hidden_states = final_hidden_states.view(x.shape)
+            bc_sh_exp = self.bc_sh_exp
+
+        # Fallback fused path when bc is not available (non-quantized or partial quantization)
         elif bsz > 1:
 
             final_hidden_states = torch.empty_like(y, dtype = self.out_dtype)
@@ -569,12 +579,6 @@ class BlockSparseMLP(Module):
             y = y.unsqueeze(1).unsqueeze(1)
             selected_experts = selected_experts.unsqueeze(1)
             routing_weights = routing_weights.unsqueeze(1)
-
-            # yh = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = torch.half, device = self.device)
-            # interm_g = torch.empty((bsz, self.num_experts_per_tok, 1, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
-            # interm_u = torch.empty_like(interm_g)
-            # interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
-            # out_d = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = self.out_dtype or torch.half, device = self.device)
 
             cfg = self.experts_cfg
 

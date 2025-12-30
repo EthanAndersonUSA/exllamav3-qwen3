@@ -65,4 +65,5 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("shared_experts"),
     py::arg("shared_gate")
 )
-.def("run_bsz1", &BC_BlockSparseMLP::run_bsz1);
+.def("run_bsz1", &BC_BlockSparseMLP::run_bsz1)
+.def("run_bszN", &BC_BlockSparseMLP::run_bszN);
