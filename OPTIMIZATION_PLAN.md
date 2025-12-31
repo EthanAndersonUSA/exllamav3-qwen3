@@ -47,29 +47,29 @@ Add `__prefetch_global_l2` for next token's expert weights during current comput
 
 ### Level 2: Moderate Effort (~15-25% improvement)
 
-#### 2.1 Fused Gate+Up Kernel
-Create `exl3_mgemm_fused_gate_up_gr` that:
-- Reads input once
-- Writes to double-width output buffer `[interm_g | interm_u]`
-- Uses same expert indices for both
+#### 2.1 Fused Gate+Up Kernel ✅ (Implemented)
+Created `exl3_fused_gate_up_mgemm_gr` that processes both gate and up projections
+in a single kernel launch, reducing kernel launch overhead and improving cache locality.
 
-```cpp
-// Before: 2 kernel launches, 2 input reads
-exl3_mgemm_gr(yi, gate_ptrs, interm_g, ...);
-exl3_mgemm_gr(yi, up_ptrs, interm_u, ...);
+**Implementation Details:**
+- New kernel template `exl3_fused_mgemm_kernel` in `exl3_gemm_kernel.cuh`
+- New C++ wrapper `exl3_fused_gate_up_mgemm_gr` in `exl3_gemm.cu`
+- Added `EXL3_FUSED_MGEMM_ARGS` macro in `exl3_kernel_map.cuh`
+- Updated `blocksparse_mlp.cpp` to use fused kernel with fallback for incompatible configs
+- CUDA graph patching updated for both `run_bsz1` and `run_bszN` paths
 
-// After: 1 kernel launch, 1 input read
-exl3_mgemm_fused_gate_up_gr(yi, gate_ptrs, up_ptrs, interm_gu, ...);
-```
+**Current Status:**
+- Gate and Up projections fused into single kernel when `gate_K == up_K` and flags match
+- Each expert still requires separate Hadamard transforms (due to different suh per expert)
+- Kernel launch count reduced from 2 to 1 for gate+up phase
 
-**Implementation:**
-1. Modify `exl3_mgemm_kernel.cuh` to support dual-output mode
-2. Add new function in `exl3_gemm.cu`
-3. Update `blocksparse_mlp.cpp` to use fused version
+**Potential for Further Improvement:**
+- If gate and up experts share the same `suh` (input scales), the input Hadamard could
+  be computed once and reused. Currently done twice (once per projection).
 
-**Impact:** ~15-20% from reduced memory bandwidth and kernel launches.
+**Expected Impact:** ~10-15% from reduced kernel launches and overhead.
 
-#### 2.2 Direct Output Write
+#### 2.2 Direct Output Write ✅ (Already Done)
 Eliminate `copy_row_gr` by writing down projection directly to `out_final`:
 
 ```cpp
@@ -151,9 +151,9 @@ Ensure matmul shapes align with tensor core requirements (multiples of 16/32).
 ## Recommended Implementation Order
 
 1. **Level 1.1** ✅ Power-of-2 graph caching (done)
-2. **Level 2.1** Fused Gate+Up kernel (highest ROI)
-3. **Level 2.2** Direct output write
-4. **Level 3.1** True batched processing (major rewrite)
+2. **Level 2.2** ✅ Direct output write (done)
+3. **Level 2.1** ✅ Fused Gate+Up kernel (done)
+4. **Level 3.1** True batched processing (major rewrite - not recommended for concurrency≤4)
 
 ## Benchmarking Strategy
 

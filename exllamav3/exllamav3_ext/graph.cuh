@@ -49,7 +49,15 @@ enum GraphedParams
 
     GP_add_x,
     GP_add_y,
-    GP_add_z
+    GP_add_z,
+
+    // Fused gate+up mgemm params
+    GP_fused_mgemm_A,
+    GP_fused_mgemm_C_gate,
+    GP_fused_mgemm_C_up,
+    GP_fused_mgemm_indices,
+
+    GP_mgemm_C_red
 };
 
 class Graph

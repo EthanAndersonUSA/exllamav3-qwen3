@@ -45,8 +45,32 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     const int max_index, \
     void* __restrict__ C_red
 
+// Fused gate+up mgemm: processes gate and up projections in a single kernel
+// to reduce kernel launch overhead and improve cache locality
+#define EXL3_FUSED_MGEMM_ARGS \
+    const half* __restrict__  A, \
+    const uint16_t** __restrict__ B_gate_list, \
+    const uint16_t** __restrict__ B_up_list, \
+    void* __restrict__ C_gate, \
+    void* __restrict__ C_up, \
+    const int size_m, \
+    const int size_k, \
+    const int size_n_gate, \
+    const int size_n_up, \
+    int* __restrict__ locks, \
+    const half** __restrict__ suh_gate_list, \
+    const half** __restrict__ suh_up_list, \
+    half* __restrict__ A_had, \
+    const half** __restrict__ svh_gate_list, \
+    const half** __restrict__ svh_up_list, \
+    int64_t* B_indices, \
+    const int bszm, \
+    const int min_index, \
+    const int max_index
+
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
+typedef void (*fp_exl3_fused_mgemm_kernel) (EXL3_FUSED_MGEMM_ARGS);
 
 #define EXL3_GEMM_SHAPE_1     16,     16,    128,     6,     5
 #define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
@@ -74,6 +98,13 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
+#define EXL3_FUSED_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
+    nullptr, \
+    exl3_fused_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+    exl3_fused_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_fused_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_fused_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+
 #define EXL3_GEMM_BASE_THREADS 256
 
 #define ALL_EXL3_KERNEL_EXTERNS(K) \
@@ -81,6 +112,8 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[]; \
+    extern fp_exl3_fused_mgemm_kernel tfp_exl3_fused_mgemm_kernel_fp32_b##K[]; \
+    extern fp_exl3_fused_mgemm_kernel tfp_exl3_fused_mgemm_kernel_fp16_b##K[]; \
 
 #define ALL_EXL3_KERNEL_INSTANCES(K) \
     fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[] = { \
@@ -105,6 +138,18 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 0), \
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 1), \
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 2) \
+    }; \
+    \
+    fp_exl3_fused_mgemm_kernel tfp_exl3_fused_mgemm_kernel_fp32_b##K[] = { \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, true, 0), \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, true, 1), \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, true, 2) \
+    }; \
+    \
+    fp_exl3_fused_mgemm_kernel tfp_exl3_fused_mgemm_kernel_fp16_b##K[] = { \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, false, 0), \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, false, 1), \
+        EXL3_FUSED_MGEMM_KERNEL_INSTANCES(K, false, 2) \
     };
 
 fp_exl3_gemm_kernel select_exl3_gemm_kernel
@@ -137,6 +182,22 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     const int cb,
     const int bszm_in,
     const int bszm_out
+);
+
+fp_exl3_fused_mgemm_kernel select_exl3_fused_mgemm_kernel
+(
+    const int cc,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    const int K,
+    const bool c_fp32,
+    const int force_shape_idx,
+    int* out_block_dim,
+    int* out_shape_idx,
+    int* out_num_sms,
+    const int cb,
+    const int bszm
 );
 
 struct TSample {

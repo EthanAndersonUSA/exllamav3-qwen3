@@ -72,47 +72,80 @@ void BC_BlockSparseMLP::run_bsz1_gr
     py::gil_scoped_release _;
     const at::Tensor& yi = y.unsqueeze(0);
 
-    exl3_mgemm_gr
-    (
-        yi,
-        gate_ptrs_trellis,
-        interm_g,
-        gate_ptrs_suh,
-        yh,
-        gate_ptrs_svh,
-        selected_experts,
-        {},
-        gate_K,
-        -1,
-        gate_mcg,
-        gate_mul1,
-        min_expert,
-        max_expert,
-        0,
-        {},
-        graph
-    );
+    // Use fused kernel if gate and up have compatible parameters
+    bool can_fuse = (gate_K == up_K) && (gate_mcg == up_mcg) && (gate_mul1 == up_mul1);
 
-    exl3_mgemm_gr
-    (
-        yi,
-        up_ptrs_trellis,
-        interm_u,
-        up_ptrs_suh,
-        yh,
-        up_ptrs_svh,
-        selected_experts,
-        {},
-        up_K,
-        -1,
-        up_mcg,
-        up_mul1,
-        min_expert,
-        max_expert,
-        0,
-        {},
-        graph
-    );
+    if (can_fuse)
+    {
+        // Fused gate+up kernel: single kernel launch for both projections
+        exl3_fused_gate_up_mgemm_gr
+        (
+            yi,
+            gate_ptrs_trellis,
+            up_ptrs_trellis,
+            interm_g,
+            interm_u,
+            gate_ptrs_suh,
+            up_ptrs_suh,
+            yh,
+            gate_ptrs_svh,
+            up_ptrs_svh,
+            selected_experts,
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            min_expert,
+            max_expert,
+            0,
+            graph
+        );
+    }
+    else
+    {
+        // Fallback: separate kernels for gate and up
+        exl3_mgemm_gr
+        (
+            yi,
+            gate_ptrs_trellis,
+            interm_g,
+            gate_ptrs_suh,
+            yh,
+            gate_ptrs_svh,
+            selected_experts,
+            {},
+            gate_K,
+            -1,
+            gate_mcg,
+            gate_mul1,
+            min_expert,
+            max_expert,
+            0,
+            {},
+            graph
+        );
+
+        exl3_mgemm_gr
+        (
+            yi,
+            up_ptrs_trellis,
+            interm_u,
+            up_ptrs_suh,
+            yh,
+            up_ptrs_svh,
+            selected_experts,
+            {},
+            up_K,
+            -1,
+            up_mcg,
+            up_mul1,
+            min_expert,
+            max_expert,
+            0,
+            {},
+            graph
+        );
+    }
 
     if (act_silu)
         silu_mul_gr(interm_g, interm_u, interm_a, graph);
@@ -178,15 +211,28 @@ void BC_BlockSparseMLP::run_bsz1
             graph_bsz1.capture_end();
         }
 
-        auto args = std::vector<PPTR>
+        // Check if we're using fused kernel (must match what run_bsz1_gr does)
+        bool can_fuse = (gate_K == up_K) && (gate_mcg == up_mcg) && (gate_mul1 == up_mul1);
+
+        std::vector<PPTR> args;
+        
+        if (can_fuse)
         {
-            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
-            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
-            PPTR(GP_end,                nullptr),
-            PPTR(GP_mgemm_A,            (void*) y.data_ptr()),
-            PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()),
-            PPTR(GP_end,                nullptr),
-        };
+            // Fused gate+up kernel
+            args.push_back(PPTR(GP_fused_mgemm_A,       (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_fused_mgemm_indices, (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                 nullptr));
+        }
+        else
+        {
+            // Separate gate and up kernels
+            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+            args.push_back(PPTR(GP_mgemm_A,            (void*) y.data_ptr()));
+            args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
+            args.push_back(PPTR(GP_end,                nullptr));
+        }
 
         if (shared_experts && shared_gate)
         {
@@ -227,6 +273,9 @@ void BC_BlockSparseMLP::run_bszN_gr
     Graph* graph
 )
 {
+    // Check if we can use fused gate+up kernel
+    bool can_fuse = (gate_K == up_K) && (gate_mcg == up_mcg) && (gate_mul1 == up_mul1);
+
     // Process each token in the batch sequentially using the optimized mgemm kernels
     // This moves the Python loop into C++ and enables CUDA graph capture
     for (int i = 0; i < bsz; ++i)
@@ -236,49 +285,77 @@ void BC_BlockSparseMLP::run_bszN_gr
         at::Tensor idx_i = selected_experts.slice(0, i, i + 1);
         at::Tensor w_i = routing_weights.slice(0, i, i + 1);
 
-        // Gate projection
-        exl3_mgemm_gr
-        (
-            yi,
-            gate_ptrs_trellis,
-            interm_g,
-            gate_ptrs_suh,
-            yh,
-            gate_ptrs_svh,
-            idx_i,
-            {},
-            gate_K,
-            -1,
-            gate_mcg,
-            gate_mul1,
-            min_expert,
-            max_expert,
-            0,
-            {},
-            graph
-        );
+        if (can_fuse)
+        {
+            // Fused gate+up kernel: single kernel launch for both projections
+            exl3_fused_gate_up_mgemm_gr
+            (
+                yi,
+                gate_ptrs_trellis,
+                up_ptrs_trellis,
+                interm_g,
+                interm_u,
+                gate_ptrs_suh,
+                up_ptrs_suh,
+                yh,
+                gate_ptrs_svh,
+                up_ptrs_svh,
+                idx_i,
+                gate_K,
+                -1,
+                gate_mcg,
+                gate_mul1,
+                min_expert,
+                max_expert,
+                0,
+                graph
+            );
+        }
+        else
+        {
+            // Fallback: separate kernels for gate and up
+            exl3_mgemm_gr
+            (
+                yi,
+                gate_ptrs_trellis,
+                interm_g,
+                gate_ptrs_suh,
+                yh,
+                gate_ptrs_svh,
+                idx_i,
+                {},
+                gate_K,
+                -1,
+                gate_mcg,
+                gate_mul1,
+                min_expert,
+                max_expert,
+                0,
+                {},
+                graph
+            );
 
-        // Up projection
-        exl3_mgemm_gr
-        (
-            yi,
-            up_ptrs_trellis,
-            interm_u,
-            up_ptrs_suh,
-            yh,
-            up_ptrs_svh,
-            idx_i,
-            {},
-            up_K,
-            -1,
-            up_mcg,
-            up_mul1,
-            min_expert,
-            max_expert,
-            0,
-            {},
-            graph
-        );
+            exl3_mgemm_gr
+            (
+                yi,
+                up_ptrs_trellis,
+                interm_u,
+                up_ptrs_suh,
+                yh,
+                up_ptrs_svh,
+                idx_i,
+                {},
+                up_K,
+                -1,
+                up_mcg,
+                up_mul1,
+                min_expert,
+                max_expert,
+                0,
+                {},
+                graph
+            );
+        }
 
         // Activation function
         if (act_silu)
@@ -380,16 +457,19 @@ at::Tensor BC_BlockSparseMLP::run_bszN
         }
 
         // Build parameter update list for the graph
-        // For each token in batch, we have: gate mgemm, up mgemm, activation, down mgemm, copy
-        // The mgemm calls record: GP_mgemm_A, GP_mgemm_C, GP_mgemm_indices, GP_mgemm_weights, GP_end
+        // For each token in batch, we have: gate+up (fused or separate), activation, down mgemm
+        // The mgemm calls record their parameters with GP_* constants
+        
+        // Check if we're using fused kernel (must match what run_bszN_gr does)
+        bool can_fuse = (gate_K == up_K) && (gate_mcg == up_mcg) && (gate_mul1 == up_mul1);
         
         // Calculate required size and reserve capacity to avoid reallocations
         // Per token:
-        //   gate:   3 (A, indices, end)
-        //   up:     3 (A, indices, end)
+        //   fused:  3 (A, indices, end)
+        //   OR gate+up: 6 (A, indices, end) x2
         //   down:   3 (indices, weights, end)  // outputs reduced sum directly to out_final row (via C_red)
         //   shared: 4 (A, add_y, add_z, end) or (A, add_x, add_z, end)
-        int args_per_token = 9 + (shared_experts ? 4 : 0);
+        int args_per_token = (can_fuse ? 3 : 6) + 3 + (shared_experts ? 4 : 0);
         int required_size = bsz * args_per_token;
         if (graph_args.capacity() < required_size)
             graph_args.reserve(required_size * 2);  // Reserve 2x to reduce future reallocations
@@ -403,15 +483,25 @@ at::Tensor BC_BlockSparseMLP::run_bszN
             void* w_ptr = (void*)((half*)routing_weights.data_ptr() + i * routing_weights.size(1));
             void* out_ptr = (void*) ((char*) out_final.data_ptr() + (int64_t) i * (int64_t) hidden * (int64_t) out_final.element_size());
 
-            // Gate mgemm params
-            graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
-            graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
-            graph_args.push_back(PPTR(GP_end, nullptr));
+            if (can_fuse)
+            {
+                // Fused gate+up mgemm params
+                graph_args.push_back(PPTR(GP_fused_mgemm_A, y_ptr));
+                graph_args.push_back(PPTR(GP_fused_mgemm_indices, idx_ptr));
+                graph_args.push_back(PPTR(GP_end, nullptr));
+            }
+            else
+            {
+                // Gate mgemm params
+                graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+                graph_args.push_back(PPTR(GP_end, nullptr));
 
-            // Up mgemm params
-            graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
-            graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
-            graph_args.push_back(PPTR(GP_end, nullptr));
+                // Up mgemm params
+                graph_args.push_back(PPTR(GP_mgemm_A, y_ptr));
+                graph_args.push_back(PPTR(GP_mgemm_indices, idx_ptr));
+                graph_args.push_back(PPTR(GP_end, nullptr));
+            }
 
             // Activation doesn't need param updates (uses fixed intermediate buffers)
 

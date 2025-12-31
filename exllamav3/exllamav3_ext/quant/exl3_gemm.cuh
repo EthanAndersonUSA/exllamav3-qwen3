@@ -71,3 +71,27 @@ int exl3_mgemm
     int max_index,
     int force_num_sms
 );
+
+// Fused gate+up mgemm: processes both projections in a single kernel
+int exl3_fused_gate_up_mgemm_gr
+(
+    const at::Tensor& A,
+    const at::Tensor& B_gate,
+    const at::Tensor& B_up,
+    at::Tensor& C_gate,
+    at::Tensor& C_up,
+    const at::Tensor& suh_gate,
+    const at::Tensor& suh_up,
+    const at::Tensor& A_had,
+    const at::Tensor& svh_gate,
+    const at::Tensor& svh_up,
+    const c10::optional<at::Tensor>& indices,
+    int K,
+    int force_shape_idx,
+    bool mcg,
+    bool mul1,
+    int min_index,
+    int max_index,
+    int force_num_sms,
+    Graph* graph
+);

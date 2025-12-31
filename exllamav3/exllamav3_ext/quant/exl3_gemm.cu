@@ -424,3 +424,170 @@ int exl3_mgemm
         nullptr
     );
 }
+
+/*
+Fused gate+up EXL3 multi matmul
+
+Processes both gate and up projections in a single kernel launch to reduce
+kernel launch overhead and improve cache locality. The kernel:
+1. For each expert: Gate Hadamard + Gate GEMM + Up Hadamard + Up GEMM
+
+- A: row-major input tensor, shape (1, m, k), dtype float16
+- B_gate/B_up: pointer lists to expert weights
+- C_gate/C_up: output tensors for gate and up projections
+- suh_gate/suh_up: input scale lists for each projection
+- svh_gate/svh_up: output scale lists for each projection
+*/
+
+int exl3_fused_gate_up_mgemm_gr
+(
+    const at::Tensor& A,
+    const at::Tensor& B_gate,
+    const at::Tensor& B_up,
+    at::Tensor& C_gate,
+    at::Tensor& C_up,
+    const at::Tensor& suh_gate,
+    const at::Tensor& suh_up,
+    const at::Tensor& A_had,
+    const at::Tensor& svh_gate,
+    const at::Tensor& svh_up,
+    const c10::optional<at::Tensor>& indices,
+    int K,
+    int force_shape_idx,
+    bool mcg,
+    bool mul1,
+    int min_index,
+    int max_index,
+    int force_num_sms,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DTYPE(A, kHalf);
+    TORCH_CHECK_DTYPE(B_gate, kLong);
+    TORCH_CHECK_DTYPE(B_up, kLong);
+    TORCH_CHECK_DTYPE(suh_gate, kLong);
+    TORCH_CHECK_DTYPE(suh_up, kLong);
+    TORCH_CHECK_DTYPE(svh_gate, kLong);
+    TORCH_CHECK_DTYPE(svh_up, kLong);
+
+    bool c_fp32 = C_gate.dtype() == at::kFloat;
+    if (!c_fp32) TORCH_CHECK_DTYPE(C_gate, kHalf);
+    TORCH_CHECK(C_up.dtype() == C_gate.dtype(), "C_gate and C_up must have same dtype");
+
+    TORCH_CHECK_DIM(A, 3);
+    TORCH_CHECK_DIM(B_gate, 1);
+    TORCH_CHECK_DIM(B_up, 1);
+    TORCH_CHECK_DIM(C_gate, 3);
+    TORCH_CHECK_DIM(C_up, 3);
+
+    // A is [1, m, k], indices is [1, bszm]
+    int bszm = indices ? indices.value().size(1) : C_gate.size(0);
+
+    const long* indices_ptr = (const long*) OPTPTR(indices);
+
+    int size_m = A.size(1);
+    int size_k = A.size(2);
+    int size_n_gate = C_gate.size(2);
+    int size_n_up = C_up.size(2);
+
+    // Device properties
+    int device;
+    cudaGetDevice(&device);
+    int total_sms = DevCtx::instance().get_num_sms(device);
+    int num_sms = force_num_sms ? force_num_sms : total_sms;
+    int cc = DevCtx::instance().get_cc(device);
+    int* locks = DevCtx::instance().get_locks(device);
+
+    // Dispatch pointers
+    const half* A_ptr = (const half*) A.data_ptr();
+    const uintptr_t* B_gate_ptr_ptr = (const uintptr_t*) B_gate.data_ptr();
+    const uintptr_t* B_up_ptr_ptr = (const uintptr_t*) B_up.data_ptr();
+    void* C_gate_ptr = (void*) C_gate.data_ptr();
+    void* C_up_ptr = (void*) C_up.data_ptr();
+    half* A_had_ptr = (half*) A_had.data_ptr();
+    const uintptr_t* suh_gate_ptr_ptr = (const uintptr_t*) suh_gate.data_ptr();
+    const uintptr_t* suh_up_ptr_ptr = (const uintptr_t*) suh_up.data_ptr();
+    const uintptr_t* svh_gate_ptr_ptr = (const uintptr_t*) svh_gate.data_ptr();
+    const uintptr_t* svh_up_ptr_ptr = (const uintptr_t*) svh_up.data_ptr();
+
+    // Select kernel (use gate's size_n for kernel selection, assume similar)
+    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1");
+    int cb = 0;
+    if (mcg) cb = 1;
+    if (mul1) cb = 2;
+
+    int shape_idx;
+    int block_dim;
+    fp_exl3_fused_mgemm_kernel kernel;
+
+    kernel = select_exl3_fused_mgemm_kernel
+    (
+        cc, size_m, size_k, size_n_gate, K, c_fp32,
+        force_shape_idx, &block_dim, &shape_idx,
+        &num_sms, cb, bszm
+    );
+    if (!kernel) return 0;
+
+    // Calculate concurrency
+    int tilesize_k = exl3_gemm_tilesize_k_g[shape_idx];
+    int tilesize_n = exl3_gemm_tilesize_n_g[shape_idx];
+    int tiles = MAX(size_k / tilesize_k * size_n_gate / tilesize_n, 1);
+    num_sms = tiles;
+    if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
+    if (num_sms <= total_sms && tiles / num_sms > 48) num_sms = MIN(total_sms, num_sms * 2);
+    int concurrency = MIN(total_sms / num_sms, bszm);
+
+    dim3 block_grid(num_sms, 1, concurrency);
+
+    // Launch
+    if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        kernel_attr_set[device].insert((void*) kernel);
+    }
+
+    void* kernelArgs[] =
+    {
+        (void*)& A_ptr,
+        (void*)& B_gate_ptr_ptr,
+        (void*)& B_up_ptr_ptr,
+        (void*)& C_gate_ptr,
+        (void*)& C_up_ptr,
+        (void*)& size_m,
+        (void*)& size_k,
+        (void*)& size_n_gate,
+        (void*)& size_n_up,
+        (void*)& locks,
+        (void*)& suh_gate_ptr_ptr,
+        (void*)& suh_up_ptr_ptr,
+        (void*)& A_had_ptr,
+        (void*)& svh_gate_ptr_ptr,
+        (void*)& svh_up_ptr_ptr,
+        (void*)& indices_ptr,
+        (void*)& bszm,
+        (void*)& min_index,
+        (void*)& max_index
+    };
+
+    cudaLaunchCooperativeKernel
+    (
+        (void*) kernel,
+        block_grid,
+        block_dim,
+        kernelArgs,
+        SMEM_MAX,
+        stream
+    );
+
+    if (graph) graph->record_param((void*) kernel, GP_fused_mgemm_A, 0);
+    if (graph) graph->record_param((void*) kernel, GP_fused_mgemm_C_gate, 3);
+    if (graph) graph->record_param((void*) kernel, GP_fused_mgemm_C_up, 4);
+    if (graph) graph->record_param((void*) kernel, GP_fused_mgemm_indices, 15);
+    if (graph) graph->record_param((void*) kernel, GP_end, 0);
+
+    cuda_check(cudaPeekAtLastError());
+    return shape_idx;
+}

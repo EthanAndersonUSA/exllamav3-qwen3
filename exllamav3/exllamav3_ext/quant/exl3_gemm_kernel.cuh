@@ -271,3 +271,235 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         }
     }
 }
+
+// Fused gate+up mgemm kernel
+// Processes both gate and up projections in a single kernel launch to reduce overhead
+// and improve cache locality. For each expert, we do:
+// 1. Gate Hadamard + Gate GEMM
+// 2. Up Hadamard + Up GEMM (reusing A_had buffer)
+template<EXL3_GEMM_T_ARGS>
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+void exl3_fused_mgemm_kernel(EXL3_FUSED_MGEMM_ARGS)
+{
+    auto grid = cg::this_grid();
+
+    // Pack indices within min_index <= idx < max_index
+    if (min_index >= 0)
+    {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        {
+            int j = 0;
+            for (int i = 0; i < bszm; ++i)
+            {
+                int idx = B_indices[i];
+                if (idx >= min_index && idx < max_index)
+                {
+                    v_indices[j] = idx - min_index;
+                    j++;
+                }
+            }
+            bszm_sync = j;
+            for (; j < bszm; ++j)
+            {
+                v_indices[j] = -1;
+            }
+        }
+        __threadfence();
+        grid.sync();
+        B_indices = v_indices;
+    }
+
+    int bszm_effective = (min_index >= 0) ? bszm_sync : bszm;
+
+    for (int i = 0; i < bszm_effective; i += gridDim.z)
+    {
+        int j = i + blockIdx.z;
+        int mat_index = -1;
+        const uint16_t* B_gate = nullptr;
+        const uint16_t* B_up = nullptr;
+
+        if (j < bszm_effective)
+        {
+            mat_index = B_indices ? (int) B_indices[j] : j;
+            if (mat_index >= 0)
+            {
+                B_gate = B_gate_list[mat_index];
+                B_up = B_up_list[mat_index];
+            }
+        }
+
+        // ============ GATE PROJECTION ============
+
+        if (B_gate)
+        {
+            // Hadamard transform on input for gate
+            int total_warps = size_m * size_k / 128;
+            int warps_grid = gridDim.x * blockDim.x / 32;
+            int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+
+            const half* suh_gate = suh_gate_list[mat_index];
+            const half* A_ = A;
+            half* A_had_ = A_had + j * size_m * size_k;
+
+            for(; this_warp < total_warps; this_warp += warps_grid)
+                had_hf_r_128_inner
+                (
+                    A_ + this_warp * 128,
+                    A_had_ + this_warp * 128,
+                    suh_gate + (this_warp * 128) % size_k,
+                    nullptr,
+                    0.088388347648f  // 1/sqrt(128)
+                );
+        }
+        grid.sync();
+
+        // Gate GEMM
+        if (B_gate)
+        {
+            int size_m_ = size_m;
+            half* A_ = A_had + j * size_m * size_k;
+            void* C_;
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_gate) + j * size_m * size_n_gate);
+            else                  C_ = (void*) (((half*) C_gate) + j * size_m * size_n_gate);
+
+            while (size_m_ > 0)
+            {
+                int lock_offs = blockIdx.z * size_n_gate / 128;
+
+                exl3_gemm_kernel_inner
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+                (A_, B_gate, C_, size_m_, size_k, size_n_gate, locks + lock_offs);
+
+                A_ += 16 * size_k;
+                if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n_gate);
+                else                  C_ = (void*) (((half*) C_) + 16 * size_n_gate);
+                size_m_ -= 16;
+                grid.sync();
+            }
+
+            // Output Hadamard for gate
+            {
+                int total_warps = size_m * size_n_gate / 128;
+                int warps_grid = gridDim.x * blockDim.x / 32;
+                int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+
+                const half* svh_gate = svh_gate_list[mat_index];
+
+                if constexpr (c_fp32) C_ = (void*) (((float*) C_gate) + j * size_m * size_n_gate);
+                else                  C_ = (void*) (((half*) C_gate) + j * size_m * size_n_gate);
+
+                for(; this_warp < total_warps; this_warp += warps_grid)
+                {
+                    if constexpr (c_fp32)
+                        had_ff_r_128_inner
+                        (
+                            ((const float*) C_) + this_warp * 128,
+                            ((float*) C_) + this_warp * 128,
+                            nullptr,
+                            svh_gate + (this_warp * 128) % size_n_gate,
+                            0.088388347648f
+                        );
+                    else
+                        had_hf_r_128_inner
+                        (
+                            ((const half*) C_) + this_warp * 128,
+                            ((half*) C_) + this_warp * 128,
+                            nullptr,
+                            svh_gate + (this_warp * 128) % size_n_gate,
+                            0.088388347648f
+                        );
+                }
+            }
+        }
+        grid.sync();
+
+        // ============ UP PROJECTION ============
+
+        if (B_up)
+        {
+            // Hadamard transform on input for up (reusing A_had buffer)
+            int total_warps = size_m * size_k / 128;
+            int warps_grid = gridDim.x * blockDim.x / 32;
+            int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+
+            const half* suh_up = suh_up_list[mat_index];
+            const half* A_ = A;
+            half* A_had_ = A_had + j * size_m * size_k;
+
+            for(; this_warp < total_warps; this_warp += warps_grid)
+                had_hf_r_128_inner
+                (
+                    A_ + this_warp * 128,
+                    A_had_ + this_warp * 128,
+                    suh_up + (this_warp * 128) % size_k,
+                    nullptr,
+                    0.088388347648f
+                );
+        }
+        grid.sync();
+
+        // Up GEMM
+        if (B_up)
+        {
+            int size_m_ = size_m;
+            half* A_ = A_had + j * size_m * size_k;
+            void* C_;
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_up) + j * size_m * size_n_up);
+            else                  C_ = (void*) (((half*) C_up) + j * size_m * size_n_up);
+
+            while (size_m_ > 0)
+            {
+                // Use a different lock region for up to avoid conflicts with gate
+                int lock_offs = blockIdx.z * size_n_up / 128 + gridDim.z * size_n_gate / 128;
+
+                exl3_gemm_kernel_inner
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+                (A_, B_up, C_, size_m_, size_k, size_n_up, locks + lock_offs);
+
+                A_ += 16 * size_k;
+                if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n_up);
+                else                  C_ = (void*) (((half*) C_) + 16 * size_n_up);
+                size_m_ -= 16;
+                grid.sync();
+            }
+
+            // Output Hadamard for up
+            {
+                int total_warps = size_m * size_n_up / 128;
+                int warps_grid = gridDim.x * blockDim.x / 32;
+                int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+
+                const half* svh_up = svh_up_list[mat_index];
+
+                if constexpr (c_fp32) C_ = (void*) (((float*) C_up) + j * size_m * size_n_up);
+                else                  C_ = (void*) (((half*) C_up) + j * size_m * size_n_up);
+
+                for(; this_warp < total_warps; this_warp += warps_grid)
+                {
+                    if constexpr (c_fp32)
+                        had_ff_r_128_inner
+                        (
+                            ((const float*) C_) + this_warp * 128,
+                            ((float*) C_) + this_warp * 128,
+                            nullptr,
+                            svh_up + (this_warp * 128) % size_n_up,
+                            0.088388347648f
+                        );
+                    else
+                        had_hf_r_128_inner
+                        (
+                            ((const half*) C_) + this_warp * 128,
+                            ((half*) C_) + this_warp * 128,
+                            nullptr,
+                            svh_up + (this_warp * 128) % size_n_up,
+                            0.088388347648f
+                        );
+                }
+            }
+        }
+
+        // Sync before next iteration
+        if (i + gridDim.z < bszm_effective)
+            grid.sync();
+    }
+}
