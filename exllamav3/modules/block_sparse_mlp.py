@@ -469,6 +469,17 @@ class BlockSparseMLP(Module):
                 sh_gate
             )
 
+            # Pre-warm CUDA graphs for common batch sizes to avoid capture timing
+            # issues during TP inference. All GPUs capture the same graphs at load time.
+            max_warmup_bsz = kwargs.get("max_batch_size", 8)
+            if max_warmup_bsz > 1:
+                for bsz in range(2, max_warmup_bsz + 1):
+                    dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
+                    dummy_experts = torch.zeros((bsz, self.num_experts_per_tok), dtype=torch.long, device=self.device)
+                    dummy_weights = torch.ones((bsz, self.num_experts_per_tok), dtype=torch.half, device=self.device) / self.num_experts_per_tok
+                    _ = self.bc.run_bszN(dummy_y, dummy_experts, dummy_weights)
+                torch.cuda.synchronize()
+
 
     def load_routing(self, **kwargs):
 
@@ -597,6 +608,11 @@ class BlockSparseMLP(Module):
             final_hidden_states = self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = final_hidden_states.view(x.shape)
             bc_sh_exp = self.bc_sh_exp
+
+            # Sync stream before TP all_reduce to ensure graph execution completes
+            # Graph launch is async; without this, TP processes may desync causing timeouts
+            if self.tp_reduce:
+                torch.cuda.current_stream().synchronize()
 
         # Fallback fused path when bc is not available (non-quantized or partial quantization)
         elif bsz > 1:
