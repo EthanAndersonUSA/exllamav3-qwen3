@@ -414,8 +414,18 @@ void exl3_fused_mgemm_kernel(EXL3_FUSED_MGEMM_ARGS)
         grid.sync();
 
         // ============ UP PROJECTION ============
+        //
+        // NOTE: `suh` is a *pre-scale* (applied before the Hadamard), so we can only reuse the
+        // already-computed A_had from the gate path if the pointers are identical (same tensor).
+        //
+        // If `suh_gate == suh_up`, we can skip the second Hadamard entirely and reuse A_had.
+        bool same_suh = false;
+        if (B_gate && B_up)
+        {
+            same_suh = (suh_gate_list[mat_index] == suh_up_list[mat_index]);
+        }
 
-        if (B_up)
+        if (B_up && !same_suh)
         {
             // Hadamard transform on input for up (reusing A_had buffer)
             int total_warps = size_m * size_k / 128;

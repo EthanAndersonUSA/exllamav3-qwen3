@@ -352,6 +352,33 @@ class BlockSparseMLP(Module):
 
         # Make fused modules
         if self.is_quantized:
+            # Try to deduplicate identical input pre-scales (suh) between gate and up projections.
+            #
+            # `suh` is applied *before* the Hadamard transform (see `had_hf_r_128_inner`), so if
+            # gate and up have the same `suh` tensor we can compute the input Hadamard once and
+            # reuse it for both projections in the fused kernel (pointer equality fast-path).
+            #
+            # Quantization often reuses the same random sign flips (`su`) for multiple linears that
+            # share the same Hessian H. Gate and Up in MoE share inputs, so this may apply.
+            try:
+                for g, u in zip(self.gates, self.ups):
+                    gs = getattr(g, "inner", None)
+                    us = getattr(u, "inner", None)
+                    if gs is None or us is None:
+                        continue
+                    g_suh = getattr(gs, "suh", None)
+                    u_suh = getattr(us, "suh", None)
+                    if g_suh is None or u_suh is None:
+                        continue
+                    if g_suh.data_ptr() == u_suh.data_ptr():
+                        continue
+                    # Only alias when contents match (safety)
+                    if torch.equal(g_suh, u_suh):
+                        us.suh = g_suh
+            except Exception:
+                # Best-effort optimization; ignore if anything goes wrong
+                pass
+
             self.multi_gate = MultiLinear(self.device, self.gates)
             self.multi_up = MultiLinear(self.device, self.ups)
             self.multi_down = MultiLinear(self.device, self.downs)

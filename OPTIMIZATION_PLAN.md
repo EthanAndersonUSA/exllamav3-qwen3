@@ -60,14 +60,13 @@ in a single kernel launch, reducing kernel launch overhead and improving cache l
 
 **Current Status:**
 - Gate and Up projections fused into single kernel when `gate_K == up_K` and flags match
-- Each expert still requires separate Hadamard transforms (due to different suh per expert)
 - Kernel launch count reduced from 2 to 1 for gate+up phase
+- **Hadamard Reuse:** When gate and up experts share the same `suh` pointer, the kernel
+  computes the input Hadamard once and reuses it for both projections (runtime fast-path)
+- Python-side aliasing in `block_sparse_mlp.py` deduplicates identical `suh` tensors so
+  the pointer-equality check succeeds when gate/up were quantized from the same Hessian
 
-**Potential for Further Improvement:**
-- If gate and up experts share the same `suh` (input scales), the input Hadamard could
-  be computed once and reused. Currently done twice (once per projection).
-
-**Expected Impact:** ~10-15% from reduced kernel launches and overhead.
+**Expected Impact:** ~15-20% from reduced kernel launches + Hadamard reuse.
 
 #### 2.2 Direct Output Write ✅ (Already Done)
 Eliminate `copy_row_gr` by writing down projection directly to `out_final`:
