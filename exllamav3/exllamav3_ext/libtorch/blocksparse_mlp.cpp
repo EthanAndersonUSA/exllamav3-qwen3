@@ -206,6 +206,15 @@ void BC_BlockSparseMLP::run_bsz1
 
         if (!graph_bsz1.ready)
         {
+            // Prime kernel attributes / DevCtx caches OUTSIDE graph capture.
+            //
+            // Some CUDA host APIs used by exl3 kernels (e.g. cudaFuncSetAttribute, device property
+            // queries inside DevCtx) are not allowed during stream capture and will invalidate it,
+            // causing a hard process exit in cuda_check(cudaPeekAtLastError()).
+            //
+            // Running once without a Graph ensures those one-time host calls happen before capture.
+            run_bsz1_gr(y, selected_experts, routing_weights, nullptr);
+
             graph_bsz1.capture_begin();
             run_bsz1_gr(y, selected_experts, routing_weights, &graph_bsz1);
             graph_bsz1.capture_end();
@@ -451,6 +460,13 @@ at::Tensor BC_BlockSparseMLP::run_bszN
 
         if (!g.ready)
         {
+            // Prime kernel attributes / DevCtx caches OUTSIDE graph capture.
+            //
+            // See notes in run_bsz1(): first-time kernel launches may execute non-capturable host
+            // CUDA APIs (cudaFuncSetAttribute, device queries) which invalidate stream capture.
+            // Running once without a Graph ensures capture is clean and reproducible.
+            run_bszN_gr(y, selected_experts, routing_weights, bsz, nullptr);
+
             g.capture_begin();
             run_bszN_gr(y, selected_experts, routing_weights, bsz, &g);
             g.capture_end();
