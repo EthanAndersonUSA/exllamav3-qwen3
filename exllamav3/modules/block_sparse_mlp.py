@@ -494,6 +494,13 @@ class BlockSparseMLP(Module):
                 topk = self.num_experts_per_tok
                 base = (torch.arange(topk, device=self.device, dtype=torch.long) % ex_range) + ex_first
 
+                # Pre-warm bsz=1 (uses dedicated run_bsz1 path)
+                dummy_y = torch.zeros((1, self.hidden_size), dtype=torch.half, device=self.device)
+                dummy_experts = base.unsqueeze(0).contiguous()
+                dummy_weights = torch.ones((1, topk), dtype=torch.half, device=self.device) / topk
+                self.bc.run_bsz1(dummy_y, dummy_experts, dummy_weights)
+
+                # Pre-warm bsz=2..max (uses run_bszN path)
                 for bsz in range(2, max_warmup_bsz + 1):
                     dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
                     dummy_experts = base.unsqueeze(0).expand(bsz, -1).contiguous()
