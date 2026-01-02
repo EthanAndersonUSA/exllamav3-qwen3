@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -481,8 +482,14 @@ class BlockSparseMLP(Module):
             #
             # Also: make dummy expert indices valid for sharded expert-parallel by keeping them within
             # [min_expert, max_expert) when that range is active.
-            max_warmup_bsz = kwargs.get("max_batch_size", 8)
-            if max_warmup_bsz > 1 and isinstance(self.device, int):
+            # Opt-in (recommended): this can add noticeable startup time since it captures graphs per MoE layer.
+            # Enable via env var on the server:
+            #   EXL3_PREWARM_BSZN_GRAPHS=1
+            # Optionally override max bsz to prewarm:
+            #   EXL3_PREWARM_MAX_BSZ=8
+            prewarm = os.environ.get("EXL3_PREWARM_BSZN_GRAPHS", "0") == "1"
+            max_warmup_bsz = int(os.environ.get("EXL3_PREWARM_MAX_BSZ", str(kwargs.get("max_batch_size", 8))))
+            if prewarm and max_warmup_bsz > 1 and isinstance(self.device, int):
                 # Choose a safe range of expert indices for this shard
                 if cfg.min_expert != -1 and cfg.max_expert != -1 and cfg.max_expert > cfg.min_expert:
                     ex_first = cfg.min_expert
@@ -494,14 +501,21 @@ class BlockSparseMLP(Module):
                 topk = self.num_experts_per_tok
                 base = (torch.arange(topk, device=self.device, dtype=torch.long) % ex_range) + ex_first
 
-                for bsz in range(2, max_warmup_bsz + 1):
-                    dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
-                    dummy_experts = base.unsqueeze(0).expand(bsz, -1).contiguous()
-                    dummy_weights = torch.ones((bsz, topk), dtype=torch.half, device=self.device) / topk
-                    _ = self.bc.run_bszN(dummy_y, dummy_experts, dummy_weights)
+                try:
+                    for bsz in range(2, max_warmup_bsz + 1):
+                        dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
+                        dummy_experts = base.unsqueeze(0).expand(bsz, -1).contiguous()
+                        dummy_weights = torch.ones((bsz, topk), dtype=torch.half, device=self.device) / topk
+                        _ = self.bc.run_bszN(dummy_y, dummy_experts, dummy_weights)
 
-                # Ensure captures/executions complete on this device before load continues
-                torch.cuda.synchronize(self.device)
+                    # Ensure captures/executions complete on this device before load continues
+                    torch.cuda.synchronize(self.device)
+                except Exception:
+                    # Warmup is optional; don't fail model load if it errors.
+                    # Set EXL3_PREWARM_STRICT=1 to crash on warmup failures.
+                    if os.environ.get("EXL3_PREWARM_STRICT", "0") == "1":
+                        raise
+                    print(f"[exllamav3] WARNING: MoE graph prewarm failed for {self.key} on cuda:{self.device}")
 
 
     def load_routing(self, **kwargs):
