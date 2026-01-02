@@ -471,8 +471,9 @@ class BlockSparseMLP(Module):
 
             # Pre-warm CUDA graphs for common batch sizes to avoid capture timing
             # issues during TP inference. All GPUs capture the same graphs at load time.
+            # Only run on CUDA devices (skip during CPU loading phase in TP mode)
             max_warmup_bsz = kwargs.get("max_batch_size", 8)
-            if max_warmup_bsz > 1:
+            if max_warmup_bsz > 1 and self.device.type == "cuda":
                 for bsz in range(2, max_warmup_bsz + 1):
                     dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
                     dummy_experts = torch.zeros((bsz, self.num_experts_per_tok), dtype=torch.long, device=self.device)
