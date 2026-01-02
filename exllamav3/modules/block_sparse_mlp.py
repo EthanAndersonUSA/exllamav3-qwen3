@@ -469,19 +469,39 @@ class BlockSparseMLP(Module):
                 sh_gate
             )
 
-            # Pre-warm CUDA graphs for common batch sizes to avoid capture timing
-            # issues during TP inference. All GPUs capture the same graphs at load time.
-            # Only run on CUDA devices (skip during CPU loading phase in TP mode)
-            # Note: self.device can be int (device index) or torch.device
+            # Pre-warm CUDA graphs for common batch sizes to avoid capture/replay skew in TP.
+            #
+            # Important details:
+            # - During normal (non-TP) load, Module.load sets self.device to torch.device("cpu"/"cuda:*")
+            # - During TP import, `tp_import` sets `module.device = <int GPU index>`
+            #
+            # We only pre-warm in the TP-import case (self.device is int), so we:
+            # - never try to warm on CPU (avoids the earlier CUDAGuard assert)
+            # - don't impact single-GPU non-TP model load time
+            #
+            # Also: make dummy expert indices valid for sharded expert-parallel by keeping them within
+            # [min_expert, max_expert) when that range is active.
             max_warmup_bsz = kwargs.get("max_batch_size", 8)
-            device_is_cuda = isinstance(self.device, int) or (hasattr(self.device, 'type') and self.device.type == "cuda")
-            if max_warmup_bsz > 1 and device_is_cuda:
+            if max_warmup_bsz > 1 and isinstance(self.device, int):
+                # Choose a safe range of expert indices for this shard
+                if cfg.min_expert != -1 and cfg.max_expert != -1 and cfg.max_expert > cfg.min_expert:
+                    ex_first = cfg.min_expert
+                    ex_range = cfg.max_expert - cfg.min_expert
+                else:
+                    ex_first = 0
+                    ex_range = max(1, self.num_experts)
+
+                topk = self.num_experts_per_tok
+                base = (torch.arange(topk, device=self.device, dtype=torch.long) % ex_range) + ex_first
+
                 for bsz in range(2, max_warmup_bsz + 1):
                     dummy_y = torch.zeros((bsz, self.hidden_size), dtype=torch.half, device=self.device)
-                    dummy_experts = torch.zeros((bsz, self.num_experts_per_tok), dtype=torch.long, device=self.device)
-                    dummy_weights = torch.ones((bsz, self.num_experts_per_tok), dtype=torch.half, device=self.device) / self.num_experts_per_tok
+                    dummy_experts = base.unsqueeze(0).expand(bsz, -1).contiguous()
+                    dummy_weights = torch.ones((bsz, topk), dtype=torch.half, device=self.device) / topk
                     _ = self.bc.run_bszN(dummy_y, dummy_experts, dummy_weights)
-                torch.cuda.synchronize()
+
+                # Ensure captures/executions complete on this device before load continues
+                torch.cuda.synchronize(self.device)
 
 
     def load_routing(self, **kwargs):
@@ -612,10 +632,9 @@ class BlockSparseMLP(Module):
             final_hidden_states = final_hidden_states.view(x.shape)
             bc_sh_exp = self.bc_sh_exp
 
-            # Sync stream before TP all_reduce to ensure graph execution completes
-            # Graph launch is async; without this, TP processes may desync causing timeouts
-            if self.tp_reduce:
-                torch.cuda.current_stream().synchronize()
+            # Note: `run_bszN` launches work into the current CUDA stream. TP all_reduce is also
+            # enqueued on the stream, so stream-ordering is sufficient; avoid an explicit
+            # device-wide synchronize here (it can hurt throughput).
 
         # Fallback fused path when bc is not available (non-quantized or partial quantization)
         elif bsz > 1:
